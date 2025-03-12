@@ -11,18 +11,18 @@ import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.location.*
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.dart.DartExecutor
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.view.FlutterCallbackInformation
 import kotlinx.coroutines.*
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
-import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 class LocationService : Service() {
     private val TAG = "LocationService"
     private val NOTIFICATION_CHANNEL_ID = "location_tracking_channel"
     private val NOTIFICATION_ID = 1001
+    private val CHANNEL_NAME = "com.example.app_v1/location_channel"
     
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationRequest: LocationRequest
@@ -30,16 +30,13 @@ class LocationService : Service() {
     
     private var groupName: String = ""
     private var userName: String = ""
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
     
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
     
     private var lastLocation: Location? = null
+    private var flutterEngine: FlutterEngine? = null
+    private var methodChannel: MethodChannel? = null
     
     override fun onCreate() {
         super.onCreate()
@@ -55,7 +52,12 @@ class LocationService : Service() {
         if (intent != null) {
             groupName = intent.getStringExtra("groupName") ?: ""
             userName = intent.getStringExtra("userName") ?: ""
+            val dartCallbackHandle = intent.getLongExtra("dartCallbackHandle", 0)
             Log.d(TAG, "Service started with groupName: $groupName, userName: $userName")
+            
+            if (dartCallbackHandle != 0L) {
+                initFlutterEngine(dartCallbackHandle)
+            }
         }
         
         startForeground()
@@ -63,6 +65,39 @@ class LocationService : Service() {
         startPeriodicUpdates()
         
         return START_STICKY
+    }
+
+    private fun initFlutterEngine(callbackHandle: Long) {
+        serviceScope.launch {
+            try {
+                val callbackInfo = FlutterCallbackInformation.lookupCallbackInformation(callbackHandle)
+                if (callbackInfo == null) {
+                    Log.e(TAG, "Failed to lookup callback")
+                    return@launch
+                }
+                
+                flutterEngine = FlutterEngine(this@LocationService)
+                flutterEngine?.dartExecutor?.executeDartCallback(
+                    DartExecutor.DartCallback(
+                        applicationContext.assets,
+                        FlutterInjector.instance().flutterLoader().findAppBundlePath(),
+                        callbackInfo
+                    )
+                )
+                
+                methodChannel = MethodChannel(flutterEngine?.dartExecutor?.binaryMessenger!!, CHANNEL_NAME)
+                
+                // Initialize the MongoDB connection via Flutter
+                val params = HashMap<String, Any>()
+                params["groupName"] = groupName
+                params["userName"] = userName
+                withContext(Dispatchers.Main) {
+                    methodChannel?.invokeMethod("initializeDatabase", params)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error initializing Flutter engine", e)
+            }
+        }
     }
 
     private fun createLocationRequest() {
@@ -101,7 +136,7 @@ class LocationService : Service() {
             while (isActive) {
                 try {
                     delay(2 * 60 * 1000) // 2 minutes
-                    lastLocation?.let { sendLocationToMongoDB(it) }
+                    lastLocation?.let { sendLocationToFlutter(it) }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in periodic updates", e)
                 }
@@ -109,55 +144,27 @@ class LocationService : Service() {
         }
     }
 
-    private fun sendLocationToMongoDB(location: Location) {
-        try {
-            Log.d(TAG, "Sending location to MongoDB")
-            
-            // MongoDB Atlas API endpoint (replace with your actual endpoint)
-            val url = "https://data.mongodb-api.com/app/[YOUR_APP_ID]/endpoint/data/v1/action/insertOne"
-            
-            val json = JSONObject().apply {
-                put("collection", userName)
-                put("database", groupName)
-                put("dataSource", "Cluster0") // Replace with your actual data source name
-                put("document", JSONObject().apply {
-                    put("latitude", location.latitude)
-                    put("longitude", location.longitude)
-                    put("timestamp", System.currentTimeMillis())
-                    put("accuracy", location.accuracy)
-                    put("provider", location.provider)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        put("verticalAccuracy", location.verticalAccuracyMeters)
-                    }
-                })
+    private fun sendLocationToFlutter(location: Location) {
+        serviceScope.launch {
+            try {
+                Log.d(TAG, "Sending location to Flutter for MongoDB storage")
+                
+                val locationData = HashMap<String, Any>()
+                locationData["latitude"] = location.latitude
+                locationData["longitude"] = location.longitude
+                locationData["timestamp"] = System.currentTimeMillis()
+                locationData["accuracy"] = location.accuracy
+                locationData["provider"] = location.provider
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    locationData["verticalAccuracy"] = location.verticalAccuracyMeters
+                }
+                
+                withContext(Dispatchers.Main) {
+                    methodChannel?.invokeMethod("saveLocation", locationData)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error sending location to Flutter", e)
             }
-
-            val body = json.toString().toRequestBody("application/json".toMediaType())
-            
-            val request = Request.Builder()
-                .url(url)
-                .post(body)
-                .addHeader("Content-Type", "application/json")
-                .addHeader("Accept", "application/json")
-                .addHeader("api-key", "[YOUR_API_KEY]") // Replace with your actual API key
-                .build()
-
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    Log.e(TAG, "Failed to send location to MongoDB", e)
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    if (!response.isSuccessful) {
-                        Log.e(TAG, "Unsuccessful response: ${response.code}")
-                    } else {
-                        Log.d(TAG, "Location saved successfully")
-                    }
-                    response.close()
-                }
-            })
-        } catch (e: Exception) {
-            Log.e(TAG, "Error sending location to MongoDB", e)
         }
     }
 
@@ -206,6 +213,7 @@ class LocationService : Service() {
         super.onDestroy()
         fusedLocationClient.removeLocationUpdates(locationCallback)
         serviceJob.cancel()
+        flutterEngine?.destroy()
         Log.d(TAG, "Service destroyed")
     }
 }
